@@ -12,7 +12,8 @@
  *       Run after a compile with -makedeps=<file> and either --ftime-trace --ftime-trace-granularity=0
  *       or, with a patched LDC (weka/ldc branch body-use), -body-use=<file> (not -deps, which makes the
  *       compiler analyse every imported body). Writes the inputs the compile did not depend on, one exec
- *       path per line (bazel's unused_inputs_list). Each candidates line is
+ *       path per line (bazel's unused_inputs_list): for a candidate the compile never read, its source and
+ *       its digest file; for one it read without analysing a body, its source. Each candidates line is
  *       "<input>\t<path the compiler sees>\t<digest file>". --trace is the compiler's stdout
  *       (--ftime-trace-file=-); what precedes the trace there is printed. With IFC_DIGEST_STATS set,
  *       prints the trace size and the candidate counts to stderr; with IFC_DIGEST_LIST set, each

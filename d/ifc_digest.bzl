@@ -3,9 +3,14 @@
 A D compile depends on the function bodies of an imported module only when it analyses them. With the
 cutoff on, every library computes a digest of each interface source that leaves out the bodies, and
 every compile reports through unused_inputs_list the imported sources whose bodies it never analysed (per
-its time trace, or the -body-use= report of a patched LDC): those stay in the action's key only through
-their digests. Editing such a body then
-re-runs only the compiles that analyse it. Details: d/private/tools/ifc_digest/ifc_digest.d.
+its time trace, or the -body-use= report of a patched LDC): those it loaded stay in the action's key only
+through their digests, and those it never loaded leave the key with their digests. Editing such a body
+then re-runs only the compiles that analyse it, and editing a module re-runs only the compiles that load
+it. Details: d/private/tools/ifc_digest/ifc_digest.d.
+
+Every compile's .ifc_candidates file stays in its key: a D file added to or removed from a dependency
+changes it, because a new file can satisfy an import or a __traits(compiles) probe that the compile never
+loaded a file for.
 
 Bazel honours unused_inputs_list in its local action cache, not in remote cache keys.
 
