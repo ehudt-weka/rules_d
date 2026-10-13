@@ -5,7 +5,7 @@ load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@rules_cc//cc:defs.bzl", "cc_common")
 load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
 load("//d:providers.bzl", "DSourceInfo", "DDepsInfo")
-load("//d/private:providers.bzl", "DInfo")
+load("//d/private:providers.bzl", "DInfo", "IfcDigestInfo")
 load("//d/private/rules:bitcode.bzl", "compile_bitcode_single_action", "compile_bitcode_to_native", "repack_native_objects")
 load("//d/private/rules:hdrgen.bzl", "generate_headers_action")
 load("//d/private/rules:utils.bzl", "compute_object_file_names", "compute_project_root", "object_file_name", "resolve_tristate_flag", "static_library_name", "validate_sources_under_project_root")
@@ -56,6 +56,11 @@ common_attrs = {
         default = "//d/private/scripts:compile_bitcode.sh",
         allow_single_file = True,
         doc = "Bitcode compilation script for single-action bitcode compilation",
+    ),
+    "_ifc_digest": attr.label(
+        default = "//:ifc_digest",
+        providers = [IfcDigestInfo],
+        doc = "The body-use cutoff's tool (see //d:ifc_digest.bzl)",
     ),
     "_linux_constraint": attr.label(default = "@platforms//os:linux", doc = "Linux platform constraint"),
     "_macos_constraint": attr.label(default = "@platforms//os:macos", doc = "macOS platform constraint"),
@@ -223,6 +228,44 @@ def _get_srcs(ctx):
         source_map = {}
     return srcs, hdrs, exports, exports_no_hdrs, string_srcs, source_map
 
+def _ifc_candidate_line(entry):
+    return "%s\t%s\t%s" % (entry.input, entry.seen, entry.digest)
+
+def _interface_digests(ctx, ifc, interface_srcs, source_map, all_d_deps):
+    """Declares the action computing a library's interface digests and line-capturing names.
+
+    Returns:
+        struct(entries, digests, names): this library's DInfo.ifc_* elements.
+    """
+    srcs = [f for f in interface_srcs if f.extension in ("d", "di")]
+    if not srcs:
+        return struct(entries = [], digests = [], names = [])
+    dep_names = depset(transitive = [ifc.names] + [d.ifc_names for d in all_d_deps])
+    names = ctx.actions.declare_file(ctx.label.name + ".ifc_names")
+    args = ctx.actions.args()
+    args.add("digest")
+    args.add(names, format = "--names-out=%s")
+    args.add_all(dep_names, format_each = "--names=%s")
+    entries = []
+    digests = []
+    for i, src in enumerate(srcs):
+        digest = ctx.actions.declare_file("%s_ifc/%d_%s.ifc" % (ctx.label.name, i, src.basename))
+        args.add(digest)
+        args.add(src)
+        digests.append(digest)
+        entries.append(struct(input = src.path, seen = source_map.get(src, src.path), digest = digest.path))
+    args.use_param_file("@%s", use_always = True)
+    args.set_param_file_format("multiline")
+    ctx.actions.run(
+        executable = ifc.tool,
+        arguments = [args],
+        inputs = depset(srcs, transitive = [dep_names]),
+        outputs = digests + [names],
+        mnemonic = "DIfcDigest",
+        progress_message = "Computing D interface digests of %{label}",
+    )
+    return struct(entries = entries, digests = digests, names = [names])
+
 def _compilation_impl(ctx, target_type, config, toolchain, imports, string_imports, compiler_flags, versions, global_versions, all_d_deps, source_map):
     compilation_mode = ctx.var["COMPILATION_MODE"]
     single_object = config.single_object
@@ -304,12 +347,6 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     if source_map:
         source_map_file = write_source_map(ctx, source_map)
 
-    inputs = depset(
-        direct = (srcs + string_srcs + hdrs + exports + exports_no_hdrs + [wrapper_script] + ([source_map_file] if source_map_file else [])),
-        transitive = [toolchain.d_compiler[DefaultInfo].default_runfiles.files] +
-                     [d.interface_srcs for d in all_d_deps],
-    )
-
     # Prepare environment variables for wrapper
     env = dict(ctx.var)
     env["LDC2_REAL"] = toolchain.d_compiler[DefaultInfo].files_to_run.executable.path
@@ -318,6 +355,32 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
         env["LDC2_SOURCE_MAP"] = source_map_file.path
     if toolchain.debug_repo_root_override:
         env["LDC2_DEBUG_REPO_ROOT_OVERRIDE"] = toolchain.debug_repo_root_override
+
+    # Body-use cutoff: the wrapper lists the imported sources the compile did not depend on.
+    ifc = ctx.attr._ifc_digest[IfcDigestInfo]
+    ifc_inputs = []
+    ifc_digests = []
+    unused_inputs = None
+    if ifc.tool:
+        candidates = ctx.actions.declare_file(ctx.label.name + ".ifc_candidates")
+        candidate_lines = ctx.actions.args()
+        candidate_lines.set_param_file_format("multiline")
+        candidate_lines.add_all(depset(transitive = [d.ifc_entries for d in all_d_deps]), map_each = _ifc_candidate_line)
+        ctx.actions.write(candidates, candidate_lines)
+        unused_inputs = ctx.actions.declare_file(ctx.label.name + ".unused_inputs")
+        env["IFC_DIGEST"] = ifc.tool.executable.path
+        env["IFC_CANDIDATES"] = candidates.path
+        env["IFC_UNUSED_INPUTS"] = unused_inputs.path
+        if ifc.body_use:
+            env["IFC_BODY_USE"] = "1"
+        ifc_inputs = [candidates]
+        ifc_digests = [d.ifc_digests for d in all_d_deps]
+
+    inputs = depset(
+        direct = (srcs + string_srcs + hdrs + exports + exports_no_hdrs + [wrapper_script] + ([source_map_file] if source_map_file else []) + ifc_inputs),
+        transitive = [toolchain.d_compiler[DefaultInfo].default_runfiles.files] +
+                     [d.interface_srcs for d in all_d_deps] + ifc_digests,
+    )
 
     # Declare bitcode object files if compiling via bitcode
     bc_objs = []
@@ -367,6 +430,9 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     # Add ar_tool to tools if using it for unpacking
     if compile_via_bc and toolchain.ar_tool:
         tools.append(toolchain.ar_tool[DefaultInfo].files_to_run)
+    if unused_inputs:
+        outputs.append(unused_inputs)
+        tools.append(ifc.tool)
 
     ctx.actions.run(
         inputs = inputs,
@@ -378,6 +444,7 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
         use_default_shell_env = False,
         mnemonic = "Dcompile",
         progress_message = "Compiling D %s %s" % (target_type, ctx.label.name),
+        unused_inputs_list = unused_inputs,
     )
 
     # Stage 2 & 3: Bitcode to native compilation and repacking (if bitcode enabled)
@@ -531,6 +598,17 @@ def compilation_action(ctx, target_type = TARGET_TYPE.LIBRARY, cycle_breaker = F
                 genhdrs, interface_source_map = generate_headers_action(ctx, toolchain, to_hdrgen, exports_no_hdrs, interface_source_map)
                 direct_interface_srcs = hdrs + genhdrs + exports_no_hdrs
             interface_source_map = filter_source_map(interface_source_map, direct_interface_srcs)
+
+    # Body-use cutoff: digests of what this target exports, in the shape of interface_srcs.
+    ifc = ctx.attr._ifc_digest[IfcDigestInfo]
+    own_ifc = struct(entries = [], digests = [], names = [])
+    ifc_from = d_deps
+    if ifc.tool and target_type == TARGET_TYPE.LIBRARY:
+        if cycle_breaker_lib:
+            ifc_from = [cycle_breaker_lib[DInfo]] + d_deps
+        else:
+            own_ifc = _interface_digests(ctx, ifc, direct_interface_srcs, interface_source_map, all_d_deps)
+
     deps_source_map = merge_source_maps([d.source_map for d in all_d_deps])
     our_source_map = merge_source_maps([source_map, deps_source_map])
     export_source_map = merge_source_maps([interface_source_map, deps_source_map])
@@ -618,4 +696,7 @@ def compilation_action(ctx, target_type = TARGET_TYPE.LIBRARY, cycle_breaker = F
             direct = [output] if (output and target_type == TARGET_TYPE.LIBRARY and not compile_via_bc and not ctx.attr.source_only) else [],
             transitive = [d.libs_non_bc for d in d_deps if hasattr(d, "libs_non_bc")],
         ),
+        ifc_entries = depset(own_ifc.entries, transitive = [d.ifc_entries for d in ifc_from]),
+        ifc_digests = depset(own_ifc.digests, transitive = [d.ifc_digests for d in ifc_from]),
+        ifc_names = depset(own_ifc.names, transitive = [d.ifc_names for d in ifc_from]),
     )

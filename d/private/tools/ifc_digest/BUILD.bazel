@@ -1,0 +1,11 @@
+load("//d:ifc_digest.bzl", "ifc_digest_tool")
+
+exports_files([
+    "ifc_digest.d",
+    "dmd-2.108.1-astbase-type-dyncast.patch",
+])
+
+ifc_digest_tool(
+    name = "off",
+    visibility = ["//visibility:public"],
+)

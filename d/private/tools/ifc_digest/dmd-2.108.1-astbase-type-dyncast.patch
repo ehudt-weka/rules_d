@@ -1,0 +1,16 @@
+diff --git a/compiler/src/dmd/astbase.d b/compiler/src/dmd/astbase.d
+index 9788472..2332d06 100644
+--- a/compiler/src/dmd/astbase.d
++++ b/compiler/src/dmd/astbase.d
+@@ -2588,6 +2588,11 @@ static
+         MOD mod;
+         char* deco;
+ 
++        override final DYNCAST dyncast() const
++        {
++            return DYNCAST.type;
++        }
++
+         extern (C++) __gshared Type tvoid;
+         extern (C++) __gshared Type tint8;
+         extern (C++) __gshared Type tuns8;

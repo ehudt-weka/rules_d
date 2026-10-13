@@ -23,3 +23,10 @@ bool_flag(
     build_setting_default = False,
     visibility = ["//visibility:public"],
 )
+
+# The body-use cutoff's tool, an ifc_digest_tool target (see //d:ifc_digest.bzl). Off by default.
+label_flag(
+    name = "ifc_digest",
+    build_setting_default = "//d/private/tools/ifc_digest:off",
+    visibility = ["//visibility:public"],
+)

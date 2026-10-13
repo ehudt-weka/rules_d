@@ -15,9 +15,15 @@ def _dinfo_init(
         string_imports = None,
         versions = None,
         libs_bc = None,
-        libs_non_bc = None):
+        libs_non_bc = None,
+        ifc_entries = None,
+        ifc_digests = None,
+        ifc_names = None):
     """Initializes the DInfo provider."""
     return {
+        "ifc_entries": ifc_entries or depset(),
+        "ifc_digests": ifc_digests or depset(),
+        "ifc_names": ifc_names or depset(),
         "bc_output": bc_output,
         "bc_linking_context": bc_linking_context,
         "compilation_output": compilation_output,
@@ -51,6 +57,18 @@ DInfo, _new_dinfo = provider(
         "versions": "A depset of version identifiers.",
         "libs_bc": "A depset of bitcode library files.",
         "libs_non_bc": "A depset of non-bitcode library files.",
+        "ifc_entries": "Body-use cutoff: a depset of struct(input, seen, digest) per D interface source in interface_srcs, with the exec paths of the source and of its digest file, and the path the compiler sees it at.",
+        "ifc_digests": "Body-use cutoff: a depset of the digest files of ifc_entries.",
+        "ifc_names": "Body-use cutoff: a depset of names files, one per library, listing the line-capturing names its interface sources declare.",
     },
     init = _dinfo_init,
+)
+
+IfcDigestInfo = provider(
+    doc = "The body-use cutoff's tool (see d/private/tools/ifc_digest/ifc_digest.d).",
+    fields = {
+        "tool": "FilesToRunProvider of ifc_digest, or None when the cutoff is off.",
+        "names": "A depset of names files for the toolchain's own D sources (druntime, phobos).",
+        "body_use": "Whether the compiler reports body use with -body-use= (a patched LDC) instead of a time trace.",
+    },
 )

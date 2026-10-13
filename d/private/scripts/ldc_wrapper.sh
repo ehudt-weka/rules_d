@@ -11,6 +11,9 @@
 #   LDC2_SOURCE_MAP - Path to the source map file (optional)
 #   AR_CMD          - ar command to use (default: "ar")
 #   D_TARGET        - Target we are currently compiling (used for import hints)
+#   IFC_DIGEST      - Body-use cutoff: path to ifc_digest (optional). With it, the wrapper writes to
+#                     IFC_UNUSED_INPUTS the candidates in IFC_CANDIDATES the compile did not depend on.
+#   IFC_BODY_USE    - If set, the compiler reports body use with -body-use= instead of a time trace
 
 set -e -o pipefail
 
@@ -59,8 +62,61 @@ function d_deps_hints() {
 
 trap d_deps_hints ERR
 
+# Whether the compile can inline functions of other modules, which it then analyses with no trace
+# event; ifc_digest's pruning assumes it does not.
+function cross_module_inlining() {
+    for arg in "$@"; do
+        case "$arg" in
+            -O0|--O0|-enable-inlining=false|--enable-inlining=false|-enable-inlining=0|--enable-inlining=0) ;;
+            -enable-cross-module-inlining=false|--enable-cross-module-inlining=false) ;;
+            -enable-cross-module-inlining=0|--enable-cross-module-inlining=0) ;;
+            -O*|--O*|-inline|-enable-inlining*|--enable-inlining*) return 0 ;;
+            -enable-cross-module-inlining*|--enable-cross-module-inlining*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+IFC_ARGS=()
+IFC_PRUNE=""
+IFC_TRACE=""
+IFC_USE=""
+if [ -n "$IFC_DIGEST" ]; then
+    if cross_module_inlining "$@"; then
+        : > "$IFC_UNUSED_INPUTS"
+    else
+        IFC_PRUNE=1
+        IFC_DEPS="$IFC_UNUSED_INPUTS.makedeps"
+        # Not -deps: it makes the compiler analyse every imported body.
+        if [ -n "$IFC_BODY_USE" ]; then
+            IFC_USE="$IFC_UNUSED_INPUTS.bodyuse"
+            IFC_ARGS=(-makedeps="$IFC_DEPS" -body-use="$IFC_USE")
+        else
+            IFC_TRACE="$IFC_UNUSED_INPUTS.trace.json"
+            IFC_ARGS=(-makedeps="$IFC_DEPS" --ftime-trace --ftime-trace-granularity=0 --ftime-trace-file=-)
+        fi
+    fi
+fi
+
 # Compile with real ldc2
-"$LDC2_REAL" $DEBUG_PREFIX_MAP "$@" > >(tee stdout.log) 2> >(tee stderr.log >&2)
+if [ -n "$IFC_TRACE" ]; then
+    # The trace goes to stdout: LDC writes a trace file with a single write(2), which Linux caps at
+    # 2 GiB. prune prints whatever else the compiler wrote there.
+    "$LDC2_REAL" $DEBUG_PREFIX_MAP "$@" "${IFC_ARGS[@]}" > "$IFC_TRACE" 2> >(tee stderr.log >&2)
+else
+    "$LDC2_REAL" $DEBUG_PREFIX_MAP "$@" "${IFC_ARGS[@]}" > >(tee stdout.log) 2> >(tee stderr.log >&2)
+fi
+
+if [ -n "$IFC_PRUNE" ]; then
+    if [ -n "$IFC_USE" ]; then
+        IFC_SOURCE=(--body-use="$IFC_USE")
+    else
+        IFC_SOURCE=(--trace="$IFC_TRACE")
+    fi
+    "$IFC_DIGEST" prune --candidates="$IFC_CANDIDATES" --makedeps="$IFC_DEPS" "${IFC_SOURCE[@]}" \
+        --out="$IFC_UNUSED_INPUTS"
+    rm -f "$IFC_DEPS" "$IFC_TRACE" "$IFC_USE"
+fi
 
 # If LDC_SKIP_UNPACK is set, skip unpacking (for single-action mode)
 if [ -n "$LDC_SKIP_UNPACK" ]; then
