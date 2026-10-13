@@ -8,6 +8,7 @@ load("//d:providers.bzl", "DSourceInfo", "DDepsInfo")
 load("//d/private:providers.bzl", "DInfo", "IfcDigestInfo")
 load("//d/private/rules:bitcode.bzl", "compile_bitcode_single_action", "compile_bitcode_to_native", "repack_native_objects")
 load("//d/private/rules:hdrgen.bzl", "generate_headers_action")
+load("//d/private/rules:mem_sched.bzl", "d_compile_resource_set")
 load("//d/private/rules:utils.bzl", "compute_object_file_names", "compute_project_root", "object_file_name", "resolve_tristate_flag", "static_library_name", "validate_sources_under_project_root")
 load("//d/private/rules:source_map.bzl", "write_source_map", "filter_source_map", "merge_source_maps")
 
@@ -445,6 +446,7 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
         mnemonic = "Dcompile",
         progress_message = "Compiling D %s %s" % (target_type, ctx.label.name),
         unused_inputs_list = unused_inputs,
+        resource_set = d_compile_resource_set(ctx.label),
     )
 
     # Stage 2 & 3: Bitcode to native compilation and repacking (if bitcode enabled)
