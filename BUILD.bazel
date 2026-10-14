@@ -23,3 +23,12 @@ bool_flag(
     build_setting_default = False,
     visibility = ["//visibility:public"],
 )
+
+# Exact deps: a D compile's action key holds only the imported D sources the compile read (-makedeps),
+# so editing one it did not read does not re-run it. Bazel honours this in its local action cache, not
+# in remote cache keys. Needs GNU coreutils (realpath -e, xargs -d) where the compile runs.
+bool_flag(
+    name = "exact_deps",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)

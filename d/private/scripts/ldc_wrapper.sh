@@ -11,6 +11,10 @@
 #   LDC2_SOURCE_MAP - Path to the source map file (optional)
 #   AR_CMD          - ar command to use (default: "ar")
 #   D_TARGET        - Target we are currently compiling (used for import hints)
+#   D_EXACT_DEPS_CANDIDATES - Exact deps (optional): the imported D sources the compile may read, one
+#                     exec path per line
+#   D_EXACT_DEPS_UNUSED - With D_EXACT_DEPS_CANDIDATES: where to write the candidates the compile did not
+#                     read, for bazel's unused_inputs_list
 
 set -e -o pipefail
 
@@ -59,8 +63,35 @@ function d_deps_hints() {
 
 trap d_deps_hints ERR
 
+# Prints the candidates whose real path is not that of a file the compile read. A compile reaches an
+# import through a source map link or a sandbox link, so paths are compared after resolving links. Prints
+# nothing when a path does not resolve, so that every input stays in the key.
+function exact_deps_unused() {
+    local deps="$D_EXACT_DEPS_UNUSED.makedeps" read="$D_EXACT_DEPS_UNUSED.read" real="$D_EXACT_DEPS_UNUSED.real"
+    # -makedeps writes "<output>: \", then one "  <path> \" line per file read, with make's escapes
+    # ($$, \#, \ , \:).
+    if ! tail -n +2 "$deps" \
+            | sed -e 's/^[[:space:]]*//' -e 's/ \\$//' -e 's/\$\$/$/g' -e 's/\\\([ #:]\)/\1/g' -e '/^$/d' \
+            | xargs -r -d '\n' realpath -e -- > "$read" \
+        || ! xargs -r -d '\n' realpath -e -- < "$D_EXACT_DEPS_CANDIDATES" > "$real"; then
+        echo "exact deps: a path does not resolve; keeping every input" >&2
+        return 0
+    fi
+    paste "$D_EXACT_DEPS_CANDIDATES" "$real" | awk -F '\t' 'NR == FNR { read[$0] = 1; next } !($2 in read) { print $1 }' "$read" -
+}
+
+EXACT_DEPS_ARGS=()
+if [ -n "$D_EXACT_DEPS_UNUSED" ]; then
+    EXACT_DEPS_ARGS=(-makedeps="$D_EXACT_DEPS_UNUSED.makedeps")
+fi
+
 # Compile with real ldc2
-"$LDC2_REAL" $DEBUG_PREFIX_MAP "$@" > >(tee stdout.log) 2> >(tee stderr.log >&2)
+"$LDC2_REAL" $DEBUG_PREFIX_MAP "$@" "${EXACT_DEPS_ARGS[@]}" > >(tee stdout.log) 2> >(tee stderr.log >&2)
+
+if [ -n "$D_EXACT_DEPS_UNUSED" ]; then
+    exact_deps_unused > "$D_EXACT_DEPS_UNUSED"
+    rm -f "$D_EXACT_DEPS_UNUSED".{makedeps,read,real}
+fi
 
 # If LDC_SKIP_UNPACK is set, skip unpacking (for single-action mode)
 if [ -n "$LDC_SKIP_UNPACK" ]; then

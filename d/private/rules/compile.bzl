@@ -2,6 +2,7 @@
 
 load("@bazel_skylib//lib:dicts.bzl", "dicts")
 load("@bazel_skylib//lib:paths.bzl", "paths")
+load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 load("@rules_cc//cc:defs.bzl", "cc_common")
 load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
 load("//d:providers.bzl", "DSourceInfo", "DDepsInfo")
@@ -56,6 +57,11 @@ common_attrs = {
         default = "//d/private/scripts:compile_bitcode.sh",
         allow_single_file = True,
         doc = "Bitcode compilation script for single-action bitcode compilation",
+    ),
+    "_exact_deps": attr.label(
+        default = "//:exact_deps",
+        providers = [BuildSettingInfo],
+        doc = "Whether a compile's action key holds only the imported D sources it read",
     ),
     "_linux_constraint": attr.label(default = "@platforms//os:linux", doc = "Linux platform constraint"),
     "_macos_constraint": attr.label(default = "@platforms//os:macos", doc = "macOS platform constraint"),
@@ -223,6 +229,9 @@ def _get_srcs(ctx):
         source_map = {}
     return srcs, hdrs, exports, exports_no_hdrs, string_srcs, source_map
 
+def _imported_d_source(f):
+    return f.path if f.extension in ("d", "di") else None
+
 def _compilation_impl(ctx, target_type, config, toolchain, imports, string_imports, compiler_flags, versions, global_versions, all_d_deps, source_map):
     compilation_mode = ctx.var["COMPILATION_MODE"]
     single_object = config.single_object
@@ -304,12 +313,6 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     if source_map:
         source_map_file = write_source_map(ctx, source_map)
 
-    inputs = depset(
-        direct = (srcs + string_srcs + hdrs + exports + exports_no_hdrs + [wrapper_script] + ([source_map_file] if source_map_file else [])),
-        transitive = [toolchain.d_compiler[DefaultInfo].default_runfiles.files] +
-                     [d.interface_srcs for d in all_d_deps],
-    )
-
     # Prepare environment variables for wrapper
     env = dict(ctx.var)
     env["LDC2_REAL"] = toolchain.d_compiler[DefaultInfo].files_to_run.executable.path
@@ -318,6 +321,27 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
         env["LDC2_SOURCE_MAP"] = source_map_file.path
     if toolchain.debug_repo_root_override:
         env["LDC2_DEBUG_REPO_ROOT_OVERRIDE"] = toolchain.debug_repo_root_override
+
+    # Exact deps: the wrapper lists the imported D sources the compile did not read. The candidates file
+    # itself stays in the key: a D file added to a dependency can satisfy an import that found no file.
+    candidates = []
+    unused_inputs = None
+    if ctx.attr._exact_deps[BuildSettingInfo].value:
+        candidates_file = ctx.actions.declare_file(ctx.label.name + ".d_candidates")
+        candidate_lines = ctx.actions.args()
+        candidate_lines.set_param_file_format("multiline")
+        candidate_lines.add_all(depset(transitive = [d.interface_srcs for d in all_d_deps]), map_each = _imported_d_source)
+        ctx.actions.write(candidates_file, candidate_lines)
+        unused_inputs = ctx.actions.declare_file(ctx.label.name + ".unused_inputs")
+        env["D_EXACT_DEPS_CANDIDATES"] = candidates_file.path
+        env["D_EXACT_DEPS_UNUSED"] = unused_inputs.path
+        candidates = [candidates_file]
+
+    inputs = depset(
+        direct = (srcs + string_srcs + hdrs + exports + exports_no_hdrs + [wrapper_script] + ([source_map_file] if source_map_file else []) + candidates),
+        transitive = [toolchain.d_compiler[DefaultInfo].default_runfiles.files] +
+                     [d.interface_srcs for d in all_d_deps],
+    )
 
     # Declare bitcode object files if compiling via bitcode
     bc_objs = []
@@ -367,6 +391,8 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     # Add ar_tool to tools if using it for unpacking
     if compile_via_bc and toolchain.ar_tool:
         tools.append(toolchain.ar_tool[DefaultInfo].files_to_run)
+    if unused_inputs:
+        outputs.append(unused_inputs)
 
     ctx.actions.run(
         inputs = inputs,
@@ -378,6 +404,7 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
         use_default_shell_env = False,
         mnemonic = "Dcompile",
         progress_message = "Compiling D %s %s" % (target_type, ctx.label.name),
+        unused_inputs_list = unused_inputs,
     )
 
     # Stage 2 & 3: Bitcode to native compilation and repacking (if bitcode enabled)
