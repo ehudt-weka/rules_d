@@ -229,8 +229,9 @@ def _get_srcs(ctx):
         source_map = {}
     return srcs, hdrs, exports, exports_no_hdrs, string_srcs, source_map
 
-def _imported_d_source(f):
-    return f.path if f.extension in ("d", "di") else None
+def _candidate_path(f):
+    # A directory stays a used input: -makedeps lists the files read under it, never the directory.
+    return None if f.is_directory else f.path
 
 def _compilation_impl(ctx, target_type, config, toolchain, imports, string_imports, compiler_flags, versions, global_versions, all_d_deps, source_map):
     compilation_mode = ctx.var["COMPILATION_MODE"]
@@ -322,15 +323,16 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     if toolchain.debug_repo_root_override:
         env["LDC2_DEBUG_REPO_ROOT_OVERRIDE"] = toolchain.debug_repo_root_override
 
-    # Exact deps: the wrapper lists the imported D sources the compile did not read. The candidates file
-    # itself stays in the key: a D file added to a dependency can satisfy an import that found no file.
+    # Exact deps: the wrapper lists the dependency files (D sources and string-import files) the compile did not
+    # read. The candidates file itself stays in the key: a file added to a dependency can satisfy an import or a
+    # string import that found no file (one in __traits(compiles) does not fail the compile).
     candidates = []
     unused_inputs = None
     if ctx.attr._exact_deps[BuildSettingInfo].value:
         candidates_file = ctx.actions.declare_file(ctx.label.name + ".d_candidates")
         candidate_lines = ctx.actions.args()
         candidate_lines.set_param_file_format("multiline")
-        candidate_lines.add_all(depset(transitive = [d.interface_srcs for d in all_d_deps]), map_each = _imported_d_source)
+        candidate_lines.add_all(depset(transitive = [d.interface_srcs for d in all_d_deps]), map_each = _candidate_path)
         ctx.actions.write(candidates_file, candidate_lines)
         unused_inputs = ctx.actions.declare_file(ctx.label.name + ".unused_inputs")
         env["D_EXACT_DEPS_CANDIDATES"] = candidates_file.path

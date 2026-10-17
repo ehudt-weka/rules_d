@@ -11,8 +11,8 @@
 #   LDC2_SOURCE_MAP - Path to the source map file (optional)
 #   AR_CMD          - ar command to use (default: "ar")
 #   D_TARGET        - Target we are currently compiling (used for import hints)
-#   D_EXACT_DEPS_CANDIDATES - Exact deps (optional): the imported D sources the compile may read, one
-#                     exec path per line
+#   D_EXACT_DEPS_CANDIDATES - Exact deps (optional): the dependency files (D sources, string-import files) the
+#                     compile may read, one exec path per line
 #   D_EXACT_DEPS_UNUSED - With D_EXACT_DEPS_CANDIDATES: where to write the candidates the compile did not
 #                     read, for bazel's unused_inputs_list
 
