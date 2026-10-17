@@ -77,7 +77,11 @@ function exact_deps_unused() {
         echo "exact deps: a path does not resolve; keeping every input" >&2
         return 0
     fi
-    paste "$D_EXACT_DEPS_CANDIDATES" "$real" | awk -F '\t' 'NR == FNR { read[$0] = 1; next } !($2 in read) { print $1 }' "$read" -
+    # The read list is loaded in BEGIN, not given as a file operand: as an operand, an empty list is hard to
+    # tell from the candidates, and awk takes a path with '=' for a variable assignment.
+    paste "$D_EXACT_DEPS_CANDIDATES" "$real" | EXACT_DEPS_READ="$read" awk -F '\t' '
+        BEGIN { while ((r = (getline line < ENVIRON["EXACT_DEPS_READ"])) > 0) read[line] = 1; if (r < 0) exit 1 }
+        !($2 in read) { print $1 }'
 }
 
 EXACT_DEPS_ARGS=()

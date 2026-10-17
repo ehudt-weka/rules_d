@@ -1,0 +1,10 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "exact_deps_test",
+    srcs = ["exact_deps_test.sh"],
+    args = ["$(rootpath //d/private/scripts:ldc_wrapper.sh)"],
+    data = ["//d/private/scripts:ldc_wrapper.sh"],
+    # Exact deps needs GNU coreutils (realpath -e, xargs -d).
+    target_compatible_with = ["@platforms//os:linux"],
+)
