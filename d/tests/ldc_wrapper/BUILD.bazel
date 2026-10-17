@@ -1,3 +1,4 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 sh_test(
@@ -6,5 +7,25 @@ sh_test(
     args = ["$(rootpath //d/private/scripts:ldc_wrapper.sh)"],
     data = ["//d/private/scripts:ldc_wrapper.sh"],
     # Exact deps needs GNU coreutils (realpath -e, xargs -d).
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+cc_binary(
+    name = "probe_caller",
+    testonly = True,
+    srcs = ["probe_caller.c"],
+)
+
+sh_test(
+    name = "probe_log_test",
+    srcs = ["probe_log_test.sh"],
+    args = [
+        "$(rootpath //d/private/exact_deps:libd_exact_deps_probes.so)",
+        "$(rootpath :probe_caller)",
+    ],
+    data = [
+        ":probe_caller",
+        "//d/private/exact_deps:libd_exact_deps_probes.so",
+    ],
     target_compatible_with = ["@platforms//os:linux"],
 )
