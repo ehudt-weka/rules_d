@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+# Exact deps: preloaded into the compiler to log the paths it looks up (see probe_log.c). Where LD_PRELOAD has no
+# effect, the log stays empty and the compile keeps its dependency lists in the key.
+cc_binary(
+    name = "libd_exact_deps_probes.so",
+    srcs = ["probe_log.c"],
+    # glibc before 2.33 defines stat() and lstat() inline in <sys/stat.h> when optimizing; the hooks redefine them.
+    copts = ["-fno-inline"],
+    linkopts = select({
+        "@platforms//os:linux": ["-ldl"],
+        "//conditions:default": [],
+    }),
+    linkshared = True,
+    visibility = ["//visibility:public"],
+)

@@ -63,6 +63,12 @@ common_attrs = {
         providers = [BuildSettingInfo],
         doc = "Whether a compile's action key holds only the imported D sources it read",
     ),
+    "_exact_deps_probe_log": attr.label(
+        default = "//d/private/exact_deps:libd_exact_deps_probes.so",
+        allow_single_file = True,
+        cfg = "exec",
+        doc = "Exact deps: LD_PRELOAD library logging the paths the compiler looks up",
+    ),
     "_linux_constraint": attr.label(default = "@platforms//os:linux", doc = "Linux platform constraint"),
     "_macos_constraint": attr.label(default = "@platforms//os:macos", doc = "macOS platform constraint"),
     "_windows_constraint": attr.label(default = "@platforms//os:windows", doc = "Windows platform constraint"),
@@ -233,6 +239,128 @@ def _candidate_path(f):
     # A directory stays a used input: -makedeps lists the files read under it, never the directory.
     return None if f.is_directory else f.path
 
+# Top-level packages and modules of the compiler's own import path (druntime, phobos, ImportC). A dependency file with
+# one of these names would shadow the compiler's. ldc_wrapper.sh has the same list.
+_COMPILER_TOP_LEVEL = ("core", "std", "etc", "ldc", "object", "__builtins", "__importc_builtins", "importc")
+
+# Extensions under which the compiler looks a module up (ImportC included). ldc_wrapper.sh has the same list.
+_MODULE_EXTENSIONS = (".di", ".d", ".i", ".c")
+
+def _module_keys(path, roots):
+    """The module paths (`a/b/c` for module a.b.c) under which the compiler can find the file at `path`."""
+    stem = None
+    for ext in _MODULE_EXTENSIONS:
+        if path.endswith(ext):
+            stem = path[:-len(ext)]
+            break
+    if stem == None:
+        return []
+    if stem.endswith("/package"):
+        stem = stem[:-len("/package")]
+    return [stem[len(root) + 1:] if root else stem for root in roots if not root or stem.startswith(root + "/")]
+
+def _string_keys(path, roots):
+    """The names under which a string import (-J) can find the file at `path`."""
+    return [path[len(root) + 1:] if root else path for root in roots if not root or path.startswith(root + "/")]
+
+def _root_flags(flags):
+    """The -I and -J paths among compiler flags, parsed as ldc_wrapper.sh parses the command line."""
+    iroots = []
+    jroots = []
+    pending = None
+    for flag in flags:
+        if pending:
+            (iroots if pending == "I" else jroots).append(flag)
+            pending = None
+        elif flag in ("-I", "-J"):
+            pending = flag[1]
+        elif flag.startswith("-I"):
+            iroots.append(flag[3:] if flag.startswith("-I=") else flag[2:])
+        elif flag.startswith("-J"):
+            jroots.append(flag[3:] if flag.startswith("-J=") else flag[2:])
+    return iroots, jroots
+
+def _clean_roots(roots):
+    """Import paths as ldc_wrapper.sh's clean() gives them: normalized, "" for the working directory. Absolute ones
+    are dropped: no dependency file is under one."""
+    out = {}
+    for root in roots:
+        root = paths.normalize(root) if root else "."
+        if root == ".":
+            out[""] = None
+        elif not root.startswith("/"):
+            out[root] = None
+    return list(out)
+
+def _resolution_report(dep_srcs, own_files, source_map, iroots, jroots):
+    """What decides which file a lookup finds, apart from the set of files; a compile's key keeps it.
+
+    A file added to a dependency can change what an existing lookup finds only by giving the same module (or string
+    import) a second file that the compiler finds first: `.di` before `.d`, `x.d` before `x/package.d`, the working
+    directory before the -I paths, an earlier -J path, or a file the source map links at the same path. This lists
+    every module path and string import name with more than one file among the dependencies' and the target's own
+    files, every module path that shares a top-level name with the compiler's own modules, and every source map entry
+    whose file name differs from its output's (a rename, which changes what a path links to). A file added under a new
+    name changes none of it; a lookup that found no file at all is ldc_wrapper.sh's to see.
+
+    It also lists the target's own files that are not on the command line (hdrs, exports, string_srcs): bazel finds a
+    source file the compile read by its path even after it stops being an input. The dependencies' files have stubs
+    for that (_exact_deps_stubs).
+
+    A source map entry is taken to depend only on its file's path (true of hdrgen and of source files copied into the
+    build): an entry that sends an unchanged file to another directory changes no line here.
+
+    iroots and jroots are every -I and -J path on the command line, compiler flags included: the wrapper explains a
+    failed lookup by a file found under any of them.
+    """
+    roots = _clean_roots([""] + iroots)
+    jroots = _clean_roots(jroots)
+    modules = {}
+    strings = {}
+    lines = []
+    for f in dep_srcs.to_list() + own_files:
+        dest = source_map.get(f, f.path)
+        if f in source_map:
+            base = f.basename
+            if base.endswith(".d_hdrgen.di"):
+                base = base[:-len(".d_hdrgen.di")] + ".di"
+            if base != paths.basename(dest):
+                lines.append("renamed %s %s" % (f.path, dest))
+        entry = f.path if dest == f.path else "%s=%s" % (f.path, dest)
+        for key in _module_keys(dest, roots):
+            modules.setdefault(key, []).append(entry)
+        for key in _string_keys(dest, jroots):
+            strings.setdefault(key, []).append(entry)
+    for key in sorted(modules):
+        if len(modules[key]) > 1 or key.split("/")[0] in _COMPILER_TOP_LEVEL:
+            lines.append("module %s %s" % (key, " ".join(sorted(modules[key]))))
+    for key in sorted(strings):
+        if len(strings[key]) > 1:
+            lines.append("string %s %s" % (key, " ".join(sorted(strings[key]))))
+    lines.extend(sorted(["own " + f.path for f in own_files]))
+    return "".join([line + "\n" for line in lines])
+
+# Exact deps: a dependency's source file is found by its path even after it stops being an input (bazel resolves a
+# used input's path as a source artifact when it is not a derived input of the action), so its removal would go
+# unseen. Each one gets an empty derived stub, used whenever the file is: a stub that stops being an input re-runs
+# the compile. Generated files need none. The stubs of target a/b live under a/b.exact_deps_stubs/, so they cannot
+# meet those of target a.
+_EXACT_DEPS_STUB_SUFFIX = ".exact_deps_stubs"
+
+def _exact_deps_stubs(ctx, files):
+    stubs = []
+    for f in {f: None for f in files if f.is_source}:
+        stub = ctx.actions.declare_file("%s%s/%s" % (ctx.label.name, _EXACT_DEPS_STUB_SUFFIX, f.path))
+        ctx.actions.write(stub, "")
+        stubs.append(stub)
+    return stubs
+
+def _exact_deps_stub_line(stub):
+    """'<file path>\t<stub path>' for a stub declared by _exact_deps_stubs."""
+    owner = stub.owner
+    prefix = paths.join(stub.root.path, owner.workspace_root, owner.package, owner.name + _EXACT_DEPS_STUB_SUFFIX) + "/"
+    return stub.path[len(prefix):] + "\t" + stub.path
+
 def _compilation_impl(ctx, target_type, config, toolchain, imports, string_imports, compiler_flags, versions, global_versions, all_d_deps, source_map):
     compilation_mode = ctx.var["COMPILATION_MODE"]
     single_object = config.single_object
@@ -243,12 +371,17 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     srcs, hdrs, exports, exports_no_hdrs, string_srcs, _unused_source_map = _get_srcs(ctx)
     args = ctx.actions.args()
 
+    # The flags other than sources, -I/-J paths and versions, for exact deps' import roots.
+    flags = []
+
     # Apply compiler flags in order: toolchain common, toolchain per-mode, user flags
     if toolchain.compiler_flags:
         args.add_all(toolchain.compiler_flags)
+        flags.extend(toolchain.compiler_flags)
 
     if toolchain.compiler_flags_per_mode and compilation_mode in toolchain.compiler_flags_per_mode:
         args.add_all(toolchain.compiler_flags_per_mode[compilation_mode])
+        flags.extend(toolchain.compiler_flags_per_mode[compilation_mode])
 
     for src in srcs:
         if src in source_map:
@@ -258,6 +391,7 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     args.add_all(imports.to_list(), format_each = "-I=%s")
     args.add_all(string_imports.to_list(), format_each = "-J=%s")
     args.add_all(compiler_flags.to_list())
+    flags.extend(compiler_flags.to_list())
 
     # Use version_flag from toolchain config
     version_flag = toolchain.version_flag if toolchain.version_flag else "-version="
@@ -274,6 +408,7 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
         for feature in effective_features:
             if feature in feature_flags:
                 args.add_all(feature_flags[feature])
+                flags.extend(feature_flags[feature])
 
     output = None
     if target_type == TARGET_TYPE.TEST:
@@ -283,6 +418,7 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     if target_type == TARGET_TYPE.LIBRARY:
         # Always use lib_flags to create archive
         args.add_all(toolchain.lib_flags)
+        flags.extend(toolchain.lib_flags)
 
         if single_object:
             args.add(toolchain.single_obj_flag)
@@ -306,6 +442,7 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     if compile_via_bc:
         # Add bitcode flags
         args.add_all(toolchain.output_bc_flags)
+        flags.extend(toolchain.output_bc_flags)
 
     # Unified compilation using ldc_wrapper.sh
     wrapper_script = ctx.attr._ldc_wrapper_script[DefaultInfo].files.to_list()[0]
@@ -323,26 +460,51 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     if toolchain.debug_repo_root_override:
         env["LDC2_DEBUG_REPO_ROOT_OVERRIDE"] = toolchain.debug_repo_root_override
 
-    # Exact deps: the wrapper lists the dependency files (D sources and string-import files) the compile did not
-    # read. The candidates file itself stays in the key: a file added to a dependency can satisfy an import or a
-    # string import that found no file (one in __traits(compiles) does not fail the compile).
+    # Exact deps: the wrapper lists the dependency files (D sources, string-import files) the compile did not read,
+    # with their stubs. The candidates file, the stubs file and the source map leave the key too, unless the compile
+    # looked up a file and found none where a file added to a dependency could appear; the resolution file stays in
+    # the key.
     candidates = []
+    dep_stubs = []
     unused_inputs = None
+    tools = [toolchain.d_compiler[DefaultInfo].files_to_run]
     if ctx.attr._exact_deps[BuildSettingInfo].value:
+        dep_srcs = depset(transitive = [d.interface_srcs for d in all_d_deps])
         candidates_file = ctx.actions.declare_file(ctx.label.name + ".d_candidates")
         candidate_lines = ctx.actions.args()
         candidate_lines.set_param_file_format("multiline")
-        candidate_lines.add_all(depset(transitive = [d.interface_srcs for d in all_d_deps]), map_each = _candidate_path)
+        candidate_lines.add_all(dep_srcs, map_each = _candidate_path)
         ctx.actions.write(candidates_file, candidate_lines)
+        dep_stubs = [d.exact_deps_stubs for d in all_d_deps]
+        stubs_file = ctx.actions.declare_file(ctx.label.name + ".d_stubs")
+        stub_lines = ctx.actions.args()
+        stub_lines.set_param_file_format("multiline")
+        stub_lines.add_all(depset(transitive = dep_stubs), map_each = _exact_deps_stub_line)
+        ctx.actions.write(stubs_file, stub_lines)
+        resolution_file = ctx.actions.declare_file(ctx.label.name + ".d_resolution")
+        own_files = string_srcs + hdrs + exports + exports_no_hdrs
+        flag_iroots, flag_jroots = _root_flags(flags)
+        ctx.actions.write(resolution_file, _resolution_report(
+            dep_srcs,
+            own_files,
+            source_map,
+            imports.to_list() + flag_iroots,
+            string_imports.to_list() + flag_jroots,
+        ))
         unused_inputs = ctx.actions.declare_file(ctx.label.name + ".unused_inputs")
+        probe_log = ctx.file._exact_deps_probe_log
         env["D_EXACT_DEPS_CANDIDATES"] = candidates_file.path
+        env["D_EXACT_DEPS_STUBS"] = stubs_file.path
+        env["D_EXACT_DEPS_RESOLUTION"] = resolution_file.path
         env["D_EXACT_DEPS_UNUSED"] = unused_inputs.path
-        candidates = [candidates_file]
+        env["D_EXACT_DEPS_PRELOAD"] = probe_log.path
+        candidates = [candidates_file, stubs_file, resolution_file]
+        tools.append(probe_log)
 
     inputs = depset(
         direct = (srcs + string_srcs + hdrs + exports + exports_no_hdrs + [wrapper_script] + ([source_map_file] if source_map_file else []) + candidates),
         transitive = [toolchain.d_compiler[DefaultInfo].default_runfiles.files] +
-                     [d.interface_srcs for d in all_d_deps],
+                     [d.interface_srcs for d in all_d_deps] + dep_stubs,
     )
 
     # Declare bitcode object files if compiling via bitcode
@@ -389,7 +551,6 @@ def _compilation_impl(ctx, target_type, config, toolchain, imports, string_impor
     # Stage 1: Compile (and optionally unpack if bitcode)
     args.add(compile_output, format = "-of=%s")
     outputs = [compile_output] + bc_objs
-    tools = [toolchain.d_compiler[DefaultInfo].files_to_run]
     # Add ar_tool to tools if using it for unpacking
     if compile_via_bc and toolchain.ar_tool:
         tools.append(toolchain.ar_tool[DefaultInfo].files_to_run)
@@ -509,12 +670,13 @@ def compilation_action(ctx, target_type = TARGET_TYPE.LIBRARY, cycle_breaker = F
     pkg_path = paths.join(ctx.label.workspace_root, ctx.label.package)
     imports = depset(
         ([import_base_path] if import_base_path else []) +
-        [paths.join(ctx.label.workspace_root, ctx.label.package, imp) for imp in ctx.attr.imports],
+        # Normalized: exact deps matches import paths against file paths (_resolution_report, ldc_wrapper.sh).
+        [paths.normalize(paths.join(ctx.label.workspace_root, ctx.label.package, imp)) for imp in ctx.attr.imports],
         transitive = [d.imports for d in all_d_deps],
     )
     string_imports = depset(
         ([pkg_path] if pkg_path and string_srcs else []) +
-        [paths.join(ctx.label.workspace_root, ctx.label.package, imp) for imp in ctx.attr.string_imports],
+        [paths.normalize(paths.join(ctx.label.workspace_root, ctx.label.package, imp)) for imp in ctx.attr.string_imports],
         transitive = [d.string_imports for d in all_d_deps],
     )
 
@@ -560,6 +722,15 @@ def compilation_action(ctx, target_type = TARGET_TYPE.LIBRARY, cycle_breaker = F
                 genhdrs, interface_source_map = generate_headers_action(ctx, toolchain, to_hdrgen, exports_no_hdrs, interface_source_map)
                 direct_interface_srcs = hdrs + genhdrs + exports_no_hdrs
             interface_source_map = filter_source_map(interface_source_map, direct_interface_srcs)
+    exact_deps_stubs = depset()
+    if ctx.attr._exact_deps[BuildSettingInfo].value:
+        if cycle_breaker_lib:
+            own_stubs = _exact_deps_stubs(ctx, ctx.files.string_srcs)
+            stub_deps = [cycle_breaker_lib[DInfo].exact_deps_stubs]
+        else:
+            own_stubs = _exact_deps_stubs(ctx, direct_interface_srcs + ctx.files.string_srcs)
+            stub_deps = []
+        exact_deps_stubs = depset(own_stubs, transitive = stub_deps + [d.exact_deps_stubs for d in d_deps])
     deps_source_map = merge_source_maps([d.source_map for d in all_d_deps])
     our_source_map = merge_source_maps([source_map, deps_source_map])
     export_source_map = merge_source_maps([interface_source_map, deps_source_map])
@@ -625,6 +796,7 @@ def compilation_action(ctx, target_type = TARGET_TYPE.LIBRARY, cycle_breaker = F
         bc_linking_context = bc_linking_context,
         compilation_output = output,
         compiler_flags = compiler_flags, # TODO: revisit this, is accumulating flags a good idea?
+        exact_deps_stubs = exact_deps_stubs,
         imports = imports,
         interface_srcs = depset(
             direct_interface_srcs + ctx.files.string_srcs,
